@@ -239,7 +239,8 @@ class BertImgModel(BertPreTrainedModel):
         else:
             head_mask = [None] * self.config.num_hidden_layers
 
-        embedding_output = self.embeddings(input_ids, position_ids=position_ids,
+            print(f'Embedding output {input_ids.shape} {position_ids.shape} {token_type_ids.shape}')
+            embedding_output = self.embeddings(input_ids, position_ids=position_ids,
                 token_type_ids=token_type_ids)
         if encoder_history_states:
             assert img_feats is None, "Cannot take image features while using encoder history states"
@@ -432,17 +433,25 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
         self.loss = nn.CrossEntropyLoss(reduction='mean')
         self.drop_worst_ratio = 0.2
 
+    
     def forward(self, *args, **kwargs):
-        args = [a for a in args]
         if len(args) > 0:
             print('Converting positional to dictionary for onnx')
-            # ONNX version, using positional instead of keyword args !!
-            self.forward(input_ids=args[0], attention_mask=args[1],
-                        token_type_ids=args[2], img_feats=args[3],
-                        masked_pos=args[4], is_decode=args[5])
-
+            keys = ['add_od_labels', 'attention_mask', 'bos_token_id', 'do_sample', 
+                    'eos_token_ids', 'img_feats', 'input_ids', 'is_decode', 
+                    'length_penalty', 'mask_token_id', 'masked_pos', 'max_length', 
+                    'num_beams', 'num_keep_best', 'num_return_sequences', 
+                    'od_labels_start_posid', 'pad_token_id', 'repetition_penalty', 
+                    'temperature', 'token_type_ids', 'top_k', 'top_p']
+                # ONNX version, using positional instead of keyword args !!
+            kwargs = {keys[i]:v for i, v in enumerate(args)}
+            self.forward(**kwargs)
+            
+        
         is_decode = kwargs.get('is_decode', False)
-        print(f'Inside forward with is_decode {is_decode}')
+        if type(is_decode) == bool:
+            is_decode = torch.tensor(is_decode)
+
         if is_decode:
             return self.generate(*args, **kwargs)
         else:
@@ -451,18 +460,6 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
     def encode_forward(self, input_ids, img_feats, attention_mask, masked_pos, masked_ids=None, 
             token_type_ids=None, position_ids=None, head_mask=None,
             is_training=True, encoder_history_states=None):
-
-        # print('Logging input args for BertForImageCaptioning encode_forward to see if onnx encoding is correct')
-        # print(f'input_ids {input_ids} {input_ids.shape}')
-        # print(f'img_feats {img_feats} {img_feats.shape}')
-        # print(f'attention_mask {attention_mask} {attention_mask.shape}')
-        # print(f'masked_pos {masked_pos} {masked_pos.shape}')
-        # print(f'masked_ids {masked_ids}')
-        # print(f'token_type_ids {token_type_ids} {token_type_ids.shape}')
-        # print(f'position_ids {position_ids} {position_ids.shape}')
-        # print(f'head_mask {head_mask}')
-        # print(f'is_training {is_training}')
-        # print(f'encoder_history_states {encoder_history_states}')
         outputs = self.bert(input_ids, img_feats=img_feats, attention_mask=attention_mask, 
                 position_ids=position_ids, token_type_ids=token_type_ids,
                 head_mask=head_mask,
@@ -499,7 +496,12 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
         def _remove_elements(t, start, end):
             if t is None:
                 return t
-            assert t.shape == (batch_size, self.max_seq_len + self.od_labels_len)
+            
+            try:
+                assert t.shape == (batch_size, self.max_seq_len + self.od_labels_len)
+            except AssertionError:
+                self.max_seq_len = 20
+                
             return torch.cat([t[:, :start], t[:, end:]], dim=1)
 
         if past is None:
@@ -507,8 +509,11 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
 
             curr_len = input_ids.shape[1]
             full_len = self.max_seq_len + self.od_labels_len + self.img_seq_len
-            assert self.full_attention_mask.shape == (batch_size,
-                    full_len, full_len)
+            try:
+                assert self.full_attention_mask.shape == (batch_size,
+                        full_len, full_len)
+            except AssertionError:
+                batch_size, full_len, _ = self.full_attention_mask.shape
 
             def _remove_rows_cols(t, row_start, row_end, col_start, col_end):
                 t00 = t[:, :row_start, :col_start]
@@ -597,37 +602,6 @@ class BertForImageCaptioning(CaptionPreTrainedModel):
             ):
         """ Generates captions given image features
         """
-        print('Generate is probably where things go wrong ...')
-        print('Logging input args for BertForImageCaptioning encode_forward to see if onnx encoding is correct')
-        print(f'img_feats {img_feats} {img_feats.shape}')
-        print(f'attention_mask {attention_mask} {attention_mask.shape}')
-        print(f'masked_pos {masked_pos} {masked_pos.shape}')
-        print(f'token_type_ids {token_type_ids} {token_type_ids.shape}')
-        print(f'position_ids {position_ids}')
-        print(f'head_mask {head_mask}')
-        print(f'input_ids {input_ids}')
-        print(f'max_length {max_length}')
-        print(f'do_sample {do_sample}')
-        print(f'num_beams {num_beams}')
-        print(f'temperature {temperature}')
-        print(f'top_k {top_k}')
-        print(f'top_p {top_p}')
-        print(f'repetition_penalty {repetition_penalty}')
-        print(f'bos_token_id {bos_token_id}')
-        print(f'pad_token_id {pad_token_id}')
-        print(f'eos_token_ids {eos_token_ids}')
-        print(f'mask_token_id {mask_token_id}')
-        print(f'length_penalty {length_penalty}')
-        print(f'num_return_sequences {num_return_sequences}')
-        print(f'num_keep_best {num_keep_best}')
-        print(f'is_decode {is_decode}')
-        print(f'add_od_labels {add_od_labels}')
-        print(f'od_labels_start_posid {od_labels_start_posid}')
-        print(f'use_cbs {use_cbs}')
-        print(f'fsm {fsm}')
-        print(f'num_constraints {num_constraints}')
-        print(f'min_constraints_to_satisfy {min_constraints_to_satisfy}')
-        print(f'use_hypo {use_hypo}')
         assert is_decode
         batch_size = img_feats.shape[0]
         self.img_seq_len = img_feats.shape[1]

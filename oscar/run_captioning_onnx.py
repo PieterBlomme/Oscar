@@ -3,10 +3,13 @@
 from __future__ import absolute_import, division, print_function
 import argparse
 import base64
+import os
 import os.path as op
 import random, time, json
 import numpy as np
 import torch
+import onnx
+import onnxruntime
 from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
 
@@ -323,7 +326,6 @@ class CaptionTensorizer(object):
 
 
 def build_dataset(yaml_file, tokenizer, args, is_train=True):
-    print('inside build_dataset')
     if not op.isfile(yaml_file):
         yaml_file = op.join(args.data_dir, yaml_file)
         assert op.isfile(yaml_file)
@@ -344,7 +346,6 @@ def build_dataset(yaml_file, tokenizer, args, is_train=True):
 
 
 def save_checkpoint(model, tokenizer, args, epoch, global_step):
-    print('inside save_checkpoint')
     checkpoint_dir = op.join(args.output_dir, 'checkpoint-{}-{}'.format(
         epoch, global_step))
     mkdir(checkpoint_dir)
@@ -365,14 +366,12 @@ def save_checkpoint(model, tokenizer, args, epoch, global_step):
 
 
 def compute_score_with_logits(logits, labels):
-    print('inside compute_score_with_logits')
     logits = torch.max(logits, -1)[1].data # argmax
     scores = logits == labels 
     return scores
 
 
 def train(args, train_dataset, val_dataset, model, tokenizer):
-    print('inside train')
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) 
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
@@ -485,7 +484,6 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
 
 
 def scst_train_iter(args, train_dataset, model, scst_criterion, img_keys, batch, tokenizer):
-    print('inside scst_train_iter train')
     cls_token_id, sep_token_id, pad_token_id, mask_token_id = tokenizer.convert_tokens_to_ids(
             [tokenizer.cls_token, tokenizer.sep_token, tokenizer.pad_token,
                 tokenizer.mask_token]
@@ -543,7 +541,6 @@ def scst_train_iter(args, train_dataset, model, scst_criterion, img_keys, batch,
 
 
 def get_predict_file(output_dir, yaml_file, args):
-    print('inside get_predict_file')
     cc = ['pred']
     # make sure it works with/without / in end of the path.
     data = op.basename(op.join(args.data_dir, '')[:-1])
@@ -581,7 +578,6 @@ def get_evaluate_method(predict_file):
 
 
 def evaluate(args, val_dataset, model, tokenizer, output_dir):
-    print('inside evaluate')
     assert op.isdir(output_dir)
     predict_file = get_predict_file(output_dir, val_dataset.yaml_file, args)
     if op.isfile(predict_file):
@@ -607,7 +603,6 @@ def evaluate(args, val_dataset, model, tokenizer, output_dir):
 
 
 def test(args, test_dataset, model, tokenizer, predict_file):
-    print('inside test')
     args.test_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
     test_sampler = SequentialSampler(test_dataset)
     cache_file = predict_file
@@ -620,8 +615,6 @@ def test(args, test_dataset, model, tokenizer, predict_file):
             tokenizer.sep_token, tokenizer.pad_token, tokenizer.mask_token, '.']
         )
     model.eval()
-    torch.save(model, 'oscarmodelpytorch')
-    model = torch.load('oscarmodelpytorch')
 
     def gen_rows():
         time_meter = 0
@@ -637,8 +630,6 @@ def test(args, test_dataset, model, tokenizer, predict_file):
 
         with torch.no_grad():
             for step, (img_keys, batch) in tqdm(enumerate(test_dataloader)):
-                if step > 2:
-                    break
                 is_exist = True
                 for k in img_keys:
                     if k not in exist_key2pred:
@@ -680,43 +671,87 @@ def test(args, test_dataset, model, tokenizer, predict_file):
                     })
                 tic = time.time()
 
-                ## export to onnx
-                onnx_inputs = {
-                    'input_ids':      batch[0],
-                    'attention_mask': batch[1].float(),
-                    'token_type_ids': batch[2],
-                    'img_feats': batch[3],
-                    'masked_pos': batch[4]
-                }
-                import os
-                if not os.path.exists('oscar.onnx'):
-                    with torch.no_grad():
-                        symbolic_names = {0: 'batch_size', 1: 'max_seq_len'}
-                        torch.onnx.export(model,                                            # model being run
-                                        args=tuple([onnx_inputs['input_ids'], 
-                                                    onnx_inputs['img_feats'],
-                                                    onnx_inputs['attention_mask'],
-                                                    onnx_inputs['token_type_ids'],
-                                                    onnx_inputs['masked_pos'],]),                      # model input (or a tuple for multiple inputs)
-                                        f='oscar.onnx',                              # where to save the model (can be a file or file-like object)
-                                        opset_version=10,                      # the ONNX version to export the model to
-                                        do_constant_folding=True,                         # whether to execute constant folding for optimization
-                                        input_names=['input_ids',                         # the model's input names
-                                                    'img_feats',
-                                                    'attention_mask', 
-                                                    'token_type_ids',
-                                                    'masked_pos'],
-                                        output_names=['output'],                    # the model's output names
-                                        dynamic_axes={'input_ids': symbolic_names,        # variable length axes
-                                                        'attention_mask' : symbolic_names,
-                                                        'token_type_ids' : symbolic_names,
-                                                        'img_feats' : symbolic_names,
-                                                        'masked_pos' : symbolic_names,
-                                                        'output' : symbolic_names})
-                        print("Model exported at ", 'oscar.onnx')
+                print ('INPUTS WITHOUT ONNX')
+                outputs = model(**inputs) # sanity check
 
-                outputs = model(**inputs)
+                onnx_input_names = sorted(list(inputs.keys()))
                 
+                def convert_onnx_input(onnx_in):
+                    if type(onnx_in) != torch.Tensor:
+                        response = torch.tensor(onnx_in)
+                        return response
+                    return onnx_in
+                onnx_inputs = [convert_onnx_input(inputs[k]) for k in onnx_input_names]
+
+                # convert to onnx if needed
+                if True: #not os.path.exists('oscar.onnx'):
+                    symbolic_names = {0: 'batch_size', 1: 'max_seq_len'}
+                    print('INPUTS_WITH_ONNX')
+                    torch.onnx.export(model,                                            # model being run
+                                    args=tuple(onnx_inputs),                      # model input (or a tuple for multiple inputs)
+                                    f='oscar.onnx',                              # where to save the model (can be a file or file-like object)
+                                    opset_version=10,                      # the ONNX version to export the model to
+                                    input_names=onnx_input_names,
+                                    output_names=['output'],                    # the model's output names
+                                    dynamic_axes={'input_ids': symbolic_names,        # variable length axes
+                                                    'attention_mask' : symbolic_names,
+                                                    'token_type_ids' : symbolic_names,
+                                                    'img_feats' : symbolic_names,
+                                                    'masked_pos' : symbolic_names,
+                                                    'is_decode' : symbolic_names,
+                                                    'output' : symbolic_names})
+                    print("Model exported at ", 'oscar.onnx')
+
+                    def remove_initializer_from_input(model_path):
+
+                        model = onnx.load(model_path)
+                        if model.ir_version < 4:
+                            print(
+                                'Model with ir_version below 4 requires to include initilizer in graph input'
+                            )
+                            return
+
+                        inputs = model.graph.input
+                        name_to_input = {}
+                        for input in inputs:
+                            name_to_input[input.name] = input
+
+                        for initializer in model.graph.initializer:
+                            if initializer.name in name_to_input:
+                                inputs.remove(name_to_input[initializer.name])
+
+                        onnx.save(model, model_path)
+                        print("Input initializer removed")
+
+                    remove_initializer_from_input('oscar.onnx')
+
+                    # Load the ONNX model
+                    onnx_model = onnx.load("oscar.onnx")
+
+                    # Check that the IR is well formed
+                    onnx.checker.check_model(onnx_model)
+
+                    # Print a human readable representation of the graph
+                    onnx.helper.printable_graph(onnx_model.graph)
+
+                #outputs = model(**inputs)
+
+                sess_options = onnxruntime.SessionOptions()
+
+                session = onnxruntime.InferenceSession('oscar.onnx', sess_options)
+
+                onnx_inputs = {
+                        'input_ids':      batch[0].numpy(),
+                        'attention_mask': batch[1].float().numpy(),
+                        #'token_type_ids': batch[2].numpy(),
+                        'img_feats': batch[3].numpy(),
+                        #'masked_pos': batch[4].numpy()
+                }
+                print(onnx_inputs['attention_mask'])
+                onnx_outputs = session.run(None, onnx_inputs)
+                print(onnx_outputs[0])
+                outputs = onnx_outputs[0]
+
 
                 time_meter += time.time() - tic
                 all_caps = outputs[0]  # batch_size * num_keep_best * max_len
@@ -730,6 +765,7 @@ def test(args, test_dataset, model, tokenizer, predict_file):
                     if isinstance(img_key, torch.Tensor):
                         img_key = img_key.item()
                     yield img_key, json.dumps(res)
+                break
 
         logger.info("Inference model computing time: {} seconds per batch".format(time_meter / (step+1)))
 
@@ -738,7 +774,6 @@ def test(args, test_dataset, model, tokenizer, predict_file):
 
 
 def restore_training_settings(args):
-    print('inside restore_training_settings')
     assert not args.do_train
     assert args.do_test or args.do_eval
     # restore training settings, check hasattr for backward compatibility
